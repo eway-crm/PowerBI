@@ -67,12 +67,16 @@ CreateSession = (Credential as record) =>
     in
         [SessionId = SessionId, ApiUrl = ApiUrl];
 
-UseQuery = (Query as text) => 
+QueryPageSize = 1000;
+
+UseQuery = (Query as text, optional Skip as number, optional SessionIdParam as text, optional ApiUrlParam as text) => 
     let
-        SessionResult = CreateSession(Extension.CurrentCredential()),
-        ApiUrl = SessionResult[ApiUrl],
-        SessionId = SessionResult[SessionId],
-        QueryBody = "{ ""sessionId"": """ & SessionId & """, ""query"": " & Query & " }",
+        QueryJson = Json.Document(Query),
+        QueryJsonWithPaging = if Record.HasFields(QueryJson, "Paging") = false then AddPagingToQuery(QueryJson, QueryPageSize, if Skip = null then 0 else Skip) else QueryJson,
+        SessionResult = if SessionIdParam = null then CreateSession(Extension.CurrentCredential()) else null,
+        ApiUrl = if SessionResult = null then ApiUrlParam else SessionResult[ApiUrl],
+        SessionId = if SessionResult = null then SessionIdParam else SessionResult[SessionId],
+        QueryBody = "{ ""sessionId"": """ & SessionId & """, ""query"": " & Text.FromBinary(Json.FromValue(QueryJsonWithPaging)) & " }",
         QueryResult = Json.Document(Web.Contents(ApiUrl & "Query",
             [
                 Headers = [#"Content-Type"="application/json"],
@@ -80,9 +84,19 @@ UseQuery = (Query as text) =>
                 IsRetry = true
             ]
         )),
-        LogoutResult = Logout(ApiUrl, SessionId),
+
+        AgregatedDataTable = 
+            if 
+                Record.HasFields(QueryJson, "Paging") = false and List.Count(QueryResult[Data]) = QueryPageSize 
+            then 
+                Table.Combine({Table.FromRecords(QueryResult[Data]), @UseQuery(Text.FromBinary(Json.FromValue(QueryJson)), if Skip = null then QueryPageSize else Skip + QueryPageSize, SessionId, ApiUrl)}) 
+            else 
+                Table.FromRecords(QueryResult[Data]),
+
+        LogoutResult = if AgregatedDataTable <> null and  SessionResult <> null then Logout(ApiUrl, SessionId) else [ReturnCode="rcSuccess"],
+
         Table = if QueryResult[Data] <> null and LogoutResult[ReturnCode] = "rcSuccess" 
-                    then Table.FromRecords(QueryResult[Data]) 
+                    then AgregatedDataTable
                     else "Query error: " & ToJsonString(QueryResult)
     in
         Table;
@@ -121,6 +135,9 @@ Query = (Query as nullable text, IsQueryAmount as nullable logical) =>
                             UseQuery(Query)              
     in
         ResultTable;
+
+AddPagingToQuery = (QueryObject as record, TakeParam as number, SkipParam as number) =>
+    Record.AddField(QueryObject, "Paging", [ Take=TakeParam, Skip=SkipParam ]);
 
 GetItemsByItemGuids = (Index, ApiUrl, FolderName, SessionId, IdentifiersList, IncludeRelationsParameter) =>
     let
